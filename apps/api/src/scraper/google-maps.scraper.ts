@@ -25,6 +25,23 @@ function extractLatLng(url: string): { lat: number | null; lng: number | null } 
   return { lat: null, lng: null };
 }
 
+// Google shows a consent interstitial to EU/UK IPs (and others) before any
+// Google service is usable. Without accepting it, Maps never loads its results
+// and scraping silently returns 0 leads. Pre-seeding the consent cookies plus
+// requesting an English locale reliably skips it.
+const CONSENT_COOKIES = [
+  {
+    name: "SOCS",
+    value: "CAISNQgQEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNjA0LjA3X3AwGgJlbiACGgYIgJq5Bg",
+    domain: ".google.com",
+    path: "/",
+  },
+  { name: "CONSENT", value: "YES+cb-EU+", domain: ".google.com", path: "/" },
+];
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 @Injectable()
 export class GoogleMapsScraperService {
   private readonly logger = new Logger(GoogleMapsScraperService.name);
@@ -39,44 +56,88 @@ export class GoogleMapsScraperService {
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
           "--disable-gpu",
+          "--lang=en-US",
         ],
       });
     }
     return this.browser;
   }
 
+  // Accept the consent interstitial if Google still serves one.
+  private async dismissConsentIfPresent(page: Page): Promise<void> {
+    if (!/consent\.google\.com/.test(page.url())) return;
+    const labels = [
+      "Accept all",
+      "I agree",
+      "Agree to all",
+      "Alle akzeptieren",
+      "Alles accepteren",
+      "Tout accepter",
+      "Accetta tutto",
+      "Aceptar todo",
+    ];
+    for (const label of labels) {
+      const btn = page.getByRole("button", { name: label, exact: false });
+      if ((await btn.count()) > 0) {
+        await btn.first().click().catch(() => {});
+        await page.waitForTimeout(2500);
+        return;
+      }
+    }
+    // Fall back to the generic consent form submit (works across locales).
+    const form = await page.$('form[action*="consent"] button, form button');
+    if (form) {
+      await form.click().catch(() => {});
+      await page.waitForTimeout(2500);
+    }
+  }
+
   async scrape(searchQuery: string, maxResults = 20): Promise<ScrapedBusiness[]> {
     const browser = await this.getBrowser();
-    const page = await browser.newPage();
 
-    await page.setExtraHTTPHeaders({
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    // Strip control chars + limit length before it reaches the query string.
+    const safeQuery = String(searchQuery)
+      .replace(/[\x00-\x1f<>"'`]/g, "")
+      .substring(0, 200);
+
+    const context = await browser.newContext({
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      userAgent: USER_AGENT,
+      viewport: { width: 1280, height: 800 },
     });
-    await page.setViewportSize({ width: 1280, height: 800 });
+    await context.addCookies(CONSENT_COOKIES);
+    const page = await context.newPage();
 
     try {
-      await page.goto("https://www.google.com/maps/", {
-        waitUntil: "domcontentloaded",
-        timeout: 60000,
-      });
-      await page.waitForTimeout(2000);
-
-      // Strip control chars + limit length before typing into the search box.
-      const safeQuery = String(searchQuery)
-        .replace(/[\x00-\x1f<>"'`]/g, "")
-        .substring(0, 200);
-
       this.logger.log(`Searching Google Maps: "${safeQuery}"`);
 
-      const searchBox = await page.$(
-        '#searchboxinput, input[name="q"], [aria-label="Search Google Maps"]',
-      );
-      if (searchBox) {
-        await searchBox.click({ clickCount: 3 });
-        await page.keyboard.type(safeQuery, { delay: 40 });
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(3000);
+      // Navigate straight to a search URL (hl=en forces the English UI) so we do
+      // not depend on finding the search box before results exist.
+      const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(
+        safeQuery,
+      )}/?hl=en&gl=us`;
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(2500);
+
+      await this.dismissConsentIfPresent(page);
+      if (/consent\.google\.com/.test(page.url())) {
+        // Consent accepted: continue back to the original search.
+        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForTimeout(2500);
+      }
+
+      // If we landed on the Maps home page (no results), use the search box.
+      if (!/\/maps\/search\//.test(page.url())) {
+        const searchBox = await page.$(
+          '#searchboxinput, input[name="q"], [aria-label="Search Google Maps"]',
+        );
+        if (searchBox) {
+          await searchBox.click({ clickCount: 3 });
+          await page.keyboard.type(safeQuery, { delay: 40 });
+          await page.keyboard.press("Enter");
+          await page.waitForTimeout(3000);
+        }
       }
 
       await this.scrollResultsList(page, maxResults);
@@ -84,11 +145,11 @@ export class GoogleMapsScraperService {
       const businesses = await this.extractBusinessCards(page);
       this.logger.log(`Extracted ${businesses.length} businesses from Google Maps`);
 
-      await page.close();
+      await context.close();
       return businesses.slice(0, maxResults);
     } catch (err) {
       this.logger.error(`Google Maps scraping error: ${err}`);
-      await page.close();
+      await context.close().catch(() => {});
       return [];
     }
   }
