@@ -1,4 +1,9 @@
 FROM node:22-bookworm-slim AS base
+# openssl + ca-certificates must be present when `prisma generate` runs so the
+# correct debian-openssl-3.0.x engine is generated for this (bookworm) platform.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN npm install -g pnpm@9.14.4
 
 FROM base AS deps
