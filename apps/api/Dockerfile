@@ -1,4 +1,4 @@
-FROM node:22-alpine AS base
+FROM node:22-bookworm-slim AS base
 RUN npm install -g pnpm@9.14.4
 
 FROM base AS deps
@@ -18,13 +18,15 @@ COPY . .
 RUN pnpm --filter @prospex/database exec prisma generate
 RUN pnpm --filter @prospex/api build
 
-# Playwright needs system deps for Chromium
+# Runtime: same glibc base as the builder so the Prisma engine generated above
+# matches the runtime platform (no runtime download / permission errors).
 FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 RUN npm install -g pnpm@9.14.4
 
-# Chromium system deps
+# Chromium system deps + openssl (required by Prisma on Debian)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl ca-certificates \
     libglib2.0-0 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libdbus-1-3 libxkbcommon0 libx11-6 libxcomposite1 \
     libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
@@ -40,10 +42,12 @@ COPY --from=builder /app/packages/types ./packages/types
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/pnpm-workspace.yaml ./
 
-# Install Playwright Chromium browser
+# Install Playwright Chromium to a shared path the non-root user can read
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN pnpm --filter @prospex/api exec playwright install chromium
 
-RUN addgroup --system prospex && adduser --system --ingroup prospex prospex
+RUN addgroup --system prospex && adduser --system --ingroup prospex prospex \
+    && chmod -R a+rX /ms-playwright
 USER prospex
 
 WORKDIR /app/apps/api
