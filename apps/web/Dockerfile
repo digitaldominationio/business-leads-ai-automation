@@ -14,7 +14,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/apps/web/node_modules ./apps/web/node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV NEXT_PUBLIC_API_URL=http://api:3001/api
+# Same-origin API: the browser calls /api on this host and Next.js rewrites
+# (see next.config.ts) proxy those requests to the internal API service.
+ENV NEXT_PUBLIC_API_URL=/api
+ENV API_PROXY_TARGET=http://api:3001
 RUN pnpm --filter @prospex/web build
 
 FROM node:22-alpine AS runner
